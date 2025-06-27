@@ -5,6 +5,7 @@ import pygame
 import subprocess
 import json
 from collections import deque
+import cv2
 
 class Ball:
     def __init__(self, x, screen_width):
@@ -33,8 +34,10 @@ class HailoPoseEstimation:
             ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json'],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            universal_newlines=True
+            universal_newlines=True,
+            bufsize=1  # Line buffered
         )
+        print("Initializing Hailo pose estimation...")
         time.sleep(2)  # Give time for pipeline to initialize
         
     def get_keypoints(self):
@@ -46,16 +49,34 @@ class HailoPoseEstimation:
                 data = json.loads(line)
                 if 'poses' in data and len(data['poses']) > 0:
                     # Return the keypoints of the first detected person
-                    return data['poses'][0]['keypoints']
+                    keypoints = data['poses'][0]['keypoints']
+                    # Scale keypoints to match game window size
+                    scaled_keypoints = []
+                    for kp in keypoints:
+                        # Scale from 640x480 camera resolution to game window size (800x600)
+                        scaled_keypoints.append([
+                            int(kp[0] * 800/640),  # Scale X coordinate
+                            int(kp[1] * 600/480)   # Scale Y coordinate
+                        ])
+                    return scaled_keypoints
             return None
         except Exception as e:
-            print("Error reading pose data: {}".format(e))
+            print(f"Error reading pose data: {e}")
             return None
             
     def cleanup(self):
+        """Cleanup resources and close windows"""
         if self.process:
+            print("Cleaning up Hailo pipeline...")
             self.process.terminate()
             self.process.wait()
+            # Add a small delay to ensure windows close
+            time.sleep(0.5)
+            # Try to close any remaining windows
+            try:
+                cv2.destroyAllWindows()
+            except:
+                pass
 
 class MockPoseEstimation:
     """Mock pose estimation for testing"""
@@ -93,16 +114,28 @@ class BallCatchingGame:
         self.score = 0
         self.balls = []
         self.last_ball_time = time.time()
-        self.ball_interval = 1.0  # Time between new balls
+        self.ball_interval = 2.0  # Time between new balls
         self.game_duration = 60  # Game length in seconds
         self.start_time = None
         
         # Initialize pose estimation
+        self.use_mock = use_mock
         self.pose_estimator = MockPoseEstimation() if use_mock else HailoPoseEstimation()
         
         # Hand hitboxes
         self.hand_width = 40
         self.hand_height = 20
+        
+        # For real mode, we need to make sure pygame window stays on top
+        if not use_mock:
+            pygame.display.set_caption("Ball Catching Game - Press Q to quit")
+            # Try to force the window to stay on top
+            try:
+                import os
+                os.environ['SDL_VIDEO_WINDOW_POS'] = '0,0'
+                pygame.display.set_mode((self.screen_width, self.screen_height), pygame.NOFRAME | pygame.SHOWN)
+            except:
+                pass
     
     def spawn_ball(self):
         """Create a new ball at a random x position"""
@@ -169,6 +202,7 @@ class BallCatchingGame:
         """Main game loop"""
         self.start_time = time.time()
         running = True
+        clock = pygame.time.Clock()  # Add clock for consistent frame rate
         
         while running:
             current_time = time.time()
@@ -182,12 +216,15 @@ class BallCatchingGame:
                 elif event.type == pygame.KEYDOWN and event.key == pygame.K_q:
                     running = False
             
+            # Clear screen at start of frame
+            self.screen.fill((0, 0, 0))
+            
             # Spawn new balls
             if current_time - self.last_ball_time > self.ball_interval:
                 self.spawn_ball()
                 self.last_ball_time = current_time
                 # Gradually increase difficulty more gently
-                self.ball_interval = max(1.0, 2.0 - elapsed_time/180)  # Changed difficulty scaling
+                self.ball_interval = max(1.0, 2.0 - elapsed_time/180)
             
             # Get hand positions from pose estimation
             keypoints = self.pose_estimator.get_keypoints()
@@ -197,9 +234,6 @@ class BallCatchingGame:
                 
                 # Update game state
                 self.check_catches(left_hand_pos, right_hand_pos)
-                
-                # Draw frame
-                self.screen.fill((0, 0, 0))
                 
                 # Draw hands
                 self.draw_hands(left_hand_pos, right_hand_pos)
@@ -216,6 +250,9 @@ class BallCatchingGame:
                 
                 # Update display
                 pygame.display.flip()
+            
+            # Maintain consistent frame rate
+            clock.tick(60)
             
             # End game when time is up
             if time_remaining <= 0:
