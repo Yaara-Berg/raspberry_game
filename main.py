@@ -34,7 +34,7 @@ class HailoPoseEstimation:
         print("\n=== Starting HailoPoseEstimation ===")
         try:
             print("Starting rpicam-hello process...")
-            # Don't disable Qt preview since we want to use that window
+            # Don't create our own window, we'll use the Hailo "Pose" window
             cmd = ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json',
                   '--width', '640', '--height', '640', '--verbose']
             print("Command:", ' '.join(cmd))
@@ -50,12 +50,8 @@ class HailoPoseEstimation:
             print("Waiting for pipeline initialization...")
             time.sleep(3)  # Give more time for pipeline to initialize
             
-            # Initialize OpenCV window for overlay
-            cv2.namedWindow("Ball Catching Game", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Ball Catching Game", 800, 600)
-            
-            # Create transparent overlay
-            self.overlay = np.zeros((600, 800, 4), dtype=np.uint8)  # RGBA
+            # Create transparent overlay - match the Hailo window size
+            self.overlay = np.zeros((640, 640, 4), dtype=np.uint8)  # RGBA
             
             print("Pipeline initialization complete!")
                     
@@ -189,12 +185,19 @@ class BallCatchingGame:
     def __init__(self, use_mock=True):
         # Initialize pygame
         pygame.init()
-        self.screen_width = 800
-        self.screen_height = 600
+        
+        # Match the Hailo window size for real mode
+        if not use_mock:
+            self.screen_width = 640
+            self.screen_height = 640
+        else:
+            self.screen_width = 800
+            self.screen_height = 600
         
         # Set up display - use a surface for drawing that we'll overlay on the camera feed
         self.screen = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
-        pygame.display.set_caption("Ball Catching Game - Press Q to quit")
+        if use_mock:
+            pygame.display.set_caption("Ball Catching Game - Press Q to quit")
         
         self.font = pygame.font.Font(None, 36)
         
@@ -214,8 +217,8 @@ class BallCatchingGame:
         # Hand positions and hitboxes
         self.hand_width = 40
         self.hand_height = 20
-        self.default_left_hand = [200, 500]  # Default position when no pose detected
-        self.default_right_hand = [600, 500]  # Default position when no pose detected
+        self.default_left_hand = [self.screen_width//4, self.screen_height*4//5]  # Default position when no pose detected
+        self.default_right_hand = [self.screen_width*3//4, self.screen_height*4//5]  # Default position when no pose detected
         self.current_left_hand = self.default_left_hand.copy()
         self.current_right_hand = self.default_right_hand.copy()
 
@@ -324,8 +327,15 @@ class BallCatchingGame:
             keypoints = self.pose_estimator.get_keypoints()
             if keypoints and len(keypoints) >= 11:
                 last_pose_time = current_time
-                self.current_left_hand = keypoints[9]   # Left wrist
-                self.current_right_hand = keypoints[10]  # Right wrist
+                # Scale keypoints to our game window size
+                self.current_left_hand = [
+                    int(keypoints[9][0] * self.screen_width/640),
+                    int(keypoints[9][1] * self.screen_height/640)
+                ]
+                self.current_right_hand = [
+                    int(keypoints[10][0] * self.screen_width/640),
+                    int(keypoints[10][1] * self.screen_height/640)
+                ]
             elif current_time - last_pose_time > 5 and show_help:
                 msg = self.font.render('Stand in front of camera to play!', True, (255, 255, 255))
                 msg_rect = msg.get_rect(center=(self.screen_width/2, 50))
@@ -355,8 +365,8 @@ class BallCatchingGame:
             if not self.use_mock:
                 # Convert Pygame surface to CV2 overlay
                 overlay = self.pygame_surface_to_cv2_overlay(self.screen)
-                # Show the overlay in the CV2 window
-                cv2.imshow("Ball Catching Game", overlay)
+                # Show the overlay in the existing "Pose" window
+                cv2.imshow("Pose", overlay)
                 cv2.waitKey(1)
             else:
                 # In mock mode, use regular Pygame display
@@ -379,7 +389,7 @@ class BallCatchingGame:
         
         if not self.use_mock:
             overlay = self.pygame_surface_to_cv2_overlay(self.screen)
-            cv2.imshow("Ball Catching Game", overlay)
+            cv2.imshow("Pose", overlay)
             cv2.waitKey(3000)  # Show for 3 seconds
         else:
             pygame_screen = pygame.display.set_mode((self.screen_width, self.screen_height))
