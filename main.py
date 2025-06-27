@@ -29,27 +29,64 @@ class Ball:
 class HailoPoseEstimation:
     """Real Hailo pose estimation implementation"""
     def __init__(self):
-        # Start the Hailo pipeline as a subprocess
-        self.process = subprocess.Popen(
-            ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1  # Line buffered
-        )
-        print("Initializing Hailo pose estimation...")
-        time.sleep(2)  # Give time for pipeline to initialize
+        print("Starting HailoPoseEstimation initialization...")
+        try:
+            print("Attempting to start rpicam-hello process...")
+            print("Command: rpicam-hello -t 0 --post-process-file /usr/share/rpi-camera-assets/hailo_yolov8_pose.json")
+            self.process = subprocess.Popen(
+                ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                bufsize=1  # Line buffered
+            )
+            print("Process started successfully")
+            print("Waiting for pipeline initialization...")
+            time.sleep(2)  # Give time for pipeline to initialize
+            
+            # Check if process is still running
+            if self.process.poll() is not None:
+                print("ERROR: Process terminated unexpectedly!")
+                print("Return code:", self.process.poll())
+                # Get any error output
+                stdout, stderr = self.process.communicate()
+                print("Process stdout:", stdout)
+                print("Process stderr:", stderr)
+                raise Exception("Pipeline process terminated unexpectedly")
+                
+            print("Pipeline initialization complete!")
+        except FileNotFoundError as e:
+            print("ERROR: Could not find rpicam-hello command!")
+            print("Make sure Hailo software is installed and in system PATH")
+            print("Error details:", str(e))
+            raise
+        except Exception as e:
+            print("ERROR: Failed to initialize Hailo pipeline!")
+            print("Error details:", str(e))
+            raise
         
     def get_keypoints(self):
         try:
+            # Check if process is still alive
+            if self.process.poll() is not None:
+                print("ERROR: Pipeline process has terminated!")
+                stdout, stderr = self.process.communicate()
+                print("Process stdout:", stdout)
+                print("Process stderr:", stderr)
+                return None
+                
             # Read one line of output from the pipeline
+            print("Reading pose data from pipeline...")
             line = self.process.stdout.readline()
             if line:
+                print("Received data:", line.strip())
                 # Parse the JSON output
                 data = json.loads(line)
                 if 'poses' in data and len(data['poses']) > 0:
+                    print(f"Found {len(data['poses'])} poses")
                     # Return the keypoints of the first detected person
                     keypoints = data['poses'][0]['keypoints']
+                    print("Original keypoints:", keypoints)
                     # Scale keypoints to match game window size
                     scaled_keypoints = []
                     for kp in keypoints:
@@ -58,25 +95,52 @@ class HailoPoseEstimation:
                             int(kp[0] * 800/640),  # Scale X coordinate
                             int(kp[1] * 600/480)   # Scale Y coordinate
                         ])
+                    print("Scaled keypoints:", scaled_keypoints)
                     return scaled_keypoints
+                else:
+                    print("No poses detected in frame")
+            else:
+                print("No data received from pipeline")
+            return None
+        except json.JSONDecodeError as e:
+            print("ERROR: Failed to parse JSON data from pipeline!")
+            print("Raw data:", line)
+            print("Error details:", str(e))
             return None
         except Exception as e:
-            print(f"Error reading pose data: {e}")
+            print(f"ERROR: Error reading pose data: {e}")
+            print("Error type:", type(e).__name__)
+            print("Error details:", str(e))
             return None
             
     def cleanup(self):
         """Cleanup resources and close windows"""
+        print("\nStarting cleanup...")
         if self.process:
-            print("Cleaning up Hailo pipeline...")
-            self.process.terminate()
-            self.process.wait()
+            print("Terminating Hailo pipeline process...")
+            try:
+                self.process.terminate()
+                print("Waiting for process to end...")
+                self.process.wait(timeout=5)  # Wait up to 5 seconds
+                print("Process terminated successfully")
+            except subprocess.TimeoutExpired:
+                print("WARNING: Process did not terminate, forcing kill...")
+                self.process.kill()
+                self.process.wait()
+                print("Process killed")
+            except Exception as e:
+                print("ERROR during process cleanup:", str(e))
+            
             # Add a small delay to ensure windows close
+            print("Cleaning up windows...")
             time.sleep(0.5)
             # Try to close any remaining windows
             try:
                 cv2.destroyAllWindows()
-            except:
-                pass
+                print("Windows cleaned up successfully")
+            except Exception as e:
+                print("ERROR cleaning up windows:", str(e))
+        print("Cleanup complete!")
 
 class MockPoseEstimation:
     """Mock pose estimation for testing"""
