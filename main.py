@@ -7,6 +7,7 @@ import json
 from collections import deque
 import cv2
 import select
+import os
 
 class Ball:
     def __init__(self, x, screen_width):
@@ -30,12 +31,12 @@ class Ball:
 class HailoPoseEstimation:
     """Real Hailo pose estimation implementation"""
     def __init__(self):
-        print("Starting HailoPoseEstimation initialization...")
+        print("\n=== Starting HailoPoseEstimation ===")
         try:
-            print("Attempting to start rpicam-hello process...")
-            # Use the actual camera resolution we see in the logs
+            print("Starting rpicam-hello process...")
+            # Don't disable Qt preview since we want to use that window
             cmd = ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json',
-                  '--width', '640', '--height', '640', '--verbose']  # Added verbose flag for more info
+                  '--width', '640', '--height', '640', '--verbose']
             print("Command:", ' '.join(cmd))
             
             self.process = subprocess.Popen(
@@ -49,31 +50,14 @@ class HailoPoseEstimation:
             print("Waiting for pipeline initialization...")
             time.sleep(3)  # Give more time for pipeline to initialize
             
-            # Check if process is still running
-            if self.process.poll() is not None:
-                print("ERROR: Process terminated unexpectedly!")
-                print("Return code:", self.process.poll())
-                # Get any error output
-                stdout, stderr = self.process.communicate()
-                print("Process stdout:", stdout)
-                print("Process stderr:", stderr)
-                raise Exception("Pipeline process terminated unexpectedly")
-                
-            print("Pipeline initialization complete!")
+            # Initialize OpenCV window for overlay
+            cv2.namedWindow("Ball Catching Game", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Ball Catching Game", 800, 600)
             
-            # Read any initial stderr output
-            print("Checking for pipeline messages...")
-            while True:
-                try:
-                    # Use select to check if there's data to read without blocking
-                    rlist, _, _ = select.select([self.process.stderr], [], [], 0.1)  # 0.1 second timeout
-                    if not rlist:
-                        break
-                    stderr_line = self.process.stderr.readline()
-                    if stderr_line:
-                        print("Pipeline message:", stderr_line.strip())
-                except:
-                    break
+            # Create transparent overlay
+            self.overlay = np.zeros((600, 800, 4), dtype=np.uint8)  # RGBA
+            
+            print("Pipeline initialization complete!")
                     
         except FileNotFoundError as e:
             print("ERROR: Could not find rpicam-hello command!")
@@ -100,7 +84,7 @@ class HailoPoseEstimation:
                 rlist, _, _ = select.select([self.process.stderr], [], [], 0.1)  # 0.1 second timeout
                 if rlist:
                     stderr_line = self.process.stderr.readline()
-                    if stderr_line:
+                    if stderr_line and not "Viewfinder frame" in stderr_line:  # Filter out viewfinder messages
                         print("Pipeline message:", stderr_line.strip())
             except:
                 pass
@@ -113,31 +97,32 @@ class HailoPoseEstimation:
                     
                 line = self.process.stdout.readline()
                 if line:
-                    print("Received data:", line.strip())
-                    try:
-                        # Parse the JSON output
-                        data = json.loads(line)
-                        if 'poses' in data and len(data['poses']) > 0:
-                            print(f"Found {len(data['poses'])} poses")
-                            # Return the keypoints of the first detected person
-                            keypoints = data['poses'][0]['keypoints']
-                            print("Original keypoints:", keypoints)
-                            # Scale keypoints to match game window size
-                            scaled_keypoints = []
-                            for kp in keypoints:
-                                # Scale from 640x640 camera resolution to game window size (800x600)
-                                scaled_keypoints.append([
-                                    int(kp[0] * 800/640),  # Scale X coordinate
-                                    int(kp[1] * 600/640)   # Scale Y coordinate - now using 640 as source height
-                                ])
-                            print("Scaled keypoints:", scaled_keypoints)
-                            return scaled_keypoints
-                        else:
-                            print("No poses detected in frame")
-                    except json.JSONDecodeError as e:
-                        print("ERROR: Failed to parse JSON data!")
-                        print("Raw data:", line)
-                        print("Error details:", str(e))
+                    if "Viewfinder frame" not in line:  # Filter out viewfinder messages
+                        print("\nReceived data:", line.strip())
+                        try:
+                            # Parse the JSON output
+                            data = json.loads(line)
+                            if 'poses' in data and len(data['poses']) > 0:
+                                print(f"Found {len(data['poses'])} poses")
+                                # Return the keypoints of the first detected person
+                                keypoints = data['poses'][0]['keypoints']
+                                print("Original keypoints:", keypoints)
+                                # Scale keypoints to match game window size
+                                scaled_keypoints = []
+                                for kp in keypoints:
+                                    # Scale from 640x640 camera resolution to game window size (800x600)
+                                    scaled_keypoints.append([
+                                        int(kp[0] * 800/640),  # Scale X coordinate
+                                        int(kp[1] * 600/640)   # Scale Y coordinate - now using 640 as source height
+                                    ])
+                                print("Scaled keypoints:", scaled_keypoints)
+                                return scaled_keypoints
+                            else:
+                                print("No poses detected in frame")
+                        except json.JSONDecodeError as e:
+                            print("ERROR: Failed to parse JSON data!")
+                            print("Raw data:", line)
+                            print("Error details:", str(e))
                 else:
                     print("No data received from pipeline")
             except Exception as e:
@@ -206,8 +191,11 @@ class BallCatchingGame:
         pygame.init()
         self.screen_width = 800
         self.screen_height = 600
-        self.screen = pygame.display.set_mode((self.screen_width, self.screen_height))
-        pygame.display.set_caption("Ball Catching Game")
+        
+        # Set up display - use a surface for drawing that we'll overlay on the camera feed
+        self.screen = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
+        pygame.display.set_caption("Ball Catching Game - Press Q to quit")
+        
         self.font = pygame.font.Font(None, 36)
         
         # Game state
@@ -220,6 +208,7 @@ class BallCatchingGame:
         
         # Initialize pose estimation
         self.use_mock = use_mock
+        print("\n=== Starting game in {} mode ===".format("mock" if use_mock else "real"))
         self.pose_estimator = MockPoseEstimation() if use_mock else HailoPoseEstimation()
         
         # Hand positions and hitboxes
@@ -229,18 +218,7 @@ class BallCatchingGame:
         self.default_right_hand = [600, 500]  # Default position when no pose detected
         self.current_left_hand = self.default_left_hand.copy()
         self.current_right_hand = self.default_right_hand.copy()
-        
-        # For real mode, we need to make sure pygame window stays on top
-        if not use_mock:
-            pygame.display.set_caption("Ball Catching Game - Press Q to quit")
-            # Try to force the window to stay on top
-            try:
-                import os
-                os.environ['SDL_VIDEO_WINDOW_POS'] = '0,0'
-                pygame.display.set_mode((self.screen_width, self.screen_height), pygame.NOFRAME | pygame.SHOWN)
-            except:
-                pass
-    
+
     def spawn_ball(self):
         """Create a new ball at a random x position"""
         x = random.randint(self.screen_width // 10, self.screen_width * 9 // 10)
@@ -289,21 +267,34 @@ class BallCatchingGame:
     
     def draw_ui(self, time_remaining):
         """Draw score and time"""
-        # Draw score
-        score_text = self.font.render('Score: {}'.format(self.score), True, (255, 255, 255))
-        self.screen.blit(score_text, (10, 10))
+        # Create semi-transparent background for text
+        bg_surface = pygame.Surface((200, 80), pygame.SRCALPHA)
+        pygame.draw.rect(bg_surface, (0, 0, 0, 128), bg_surface.get_rect())  # Semi-transparent black
+        self.screen.blit(bg_surface, (5, 5))
         
-        # Draw time remaining
+        # Draw score and time with white text
+        score_text = self.font.render('Score: {}'.format(self.score), True, (255, 255, 255))
         time_text = self.font.render('Time: {}s'.format(int(time_remaining)), True, (255, 255, 255))
+        self.screen.blit(score_text, (10, 10))
         self.screen.blit(time_text, (10, 50))
-    
+
+    def pygame_surface_to_cv2_overlay(self, surface):
+        """Convert Pygame surface to CV2 overlay"""
+        # Get the pygame surface data as a string
+        image_string = pygame.image.tostring(surface, 'RGBA')
+        # Convert to numpy array
+        image_array = np.frombuffer(image_string, dtype=np.uint8)
+        # Reshape to 2D array with RGBA channels
+        image_array = image_array.reshape((surface.get_height(), surface.get_width(), 4))
+        return image_array
+
     def run(self):
         """Main game loop"""
         self.start_time = time.time()
         running = True
         clock = pygame.time.Clock()
         last_pose_time = time.time()
-        show_help = True  # Flag to control help message visibility
+        show_help = True
         
         while running:
             current_time = time.time()
@@ -317,17 +308,16 @@ class BallCatchingGame:
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_q:
                         running = False
-                    elif event.key == pygame.K_h:  # Toggle help with H key
+                    elif event.key == pygame.K_h:
                         show_help = not show_help
             
-            # Clear screen at start of frame
-            self.screen.fill((0, 0, 0))
+            # Clear screen with transparency
+            self.screen.fill((0, 0, 0, 0))  # Fully transparent
             
             # Spawn new balls
             if current_time - self.last_ball_time > self.ball_interval:
                 self.spawn_ball()
                 self.last_ball_time = current_time
-                # Gradually increase difficulty more gently
                 self.ball_interval = max(1.0, 2.0 - elapsed_time/180)
             
             # Get hand positions from pose estimation
@@ -336,7 +326,7 @@ class BallCatchingGame:
                 last_pose_time = current_time
                 self.current_left_hand = keypoints[9]   # Left wrist
                 self.current_right_hand = keypoints[10]  # Right wrist
-            elif current_time - last_pose_time > 5 and show_help:  # Show help message after 5 seconds without poses
+            elif current_time - last_pose_time > 5 and show_help:
                 msg = self.font.render('Stand in front of camera to play!', True, (255, 255, 255))
                 msg_rect = msg.get_rect(center=(self.screen_width/2, 50))
                 self.screen.blit(msg, msg_rect)
@@ -362,8 +352,17 @@ class BallCatchingGame:
             # Draw UI
             self.draw_ui(time_remaining)
             
-            # Update display
-            pygame.display.flip()
+            if not self.use_mock:
+                # Convert Pygame surface to CV2 overlay
+                overlay = self.pygame_surface_to_cv2_overlay(self.screen)
+                # Show the overlay in the CV2 window
+                cv2.imshow("Ball Catching Game", overlay)
+                cv2.waitKey(1)
+            else:
+                # In mock mode, use regular Pygame display
+                pygame_screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+                pygame_screen.blit(self.screen, (0, 0))
+                pygame.display.flip()
             
             # Maintain consistent frame rate
             clock.tick(60)
@@ -373,20 +372,27 @@ class BallCatchingGame:
                 running = False
         
         # Show final score
-        self.screen.fill((0, 0, 0))
+        self.screen.fill((0, 0, 0, 128))  # Semi-transparent black
         final_score_text = self.font.render('Final Score: {}'.format(self.score), True, (255, 255, 255))
         text_rect = final_score_text.get_rect(center=(self.screen_width/2, self.screen_height/2))
         self.screen.blit(final_score_text, text_rect)
-        pygame.display.flip()
         
-        # Wait a few seconds before closing
-        time.sleep(3)
+        if not self.use_mock:
+            overlay = self.pygame_surface_to_cv2_overlay(self.screen)
+            cv2.imshow("Ball Catching Game", overlay)
+            cv2.waitKey(3000)  # Show for 3 seconds
+        else:
+            pygame_screen = pygame.display.set_mode((self.screen_width, self.screen_height))
+            pygame_screen.blit(self.screen, (0, 0))
+            pygame.display.flip()
+            time.sleep(3)
         
         # Cleanup
         self.pose_estimator.cleanup()
+        cv2.destroyAllWindows()
         pygame.quit()
 
 if __name__ == "__main__":
-    # Use real Hailo pose estimation with immediate gameplay
+    # Use real mode with game overlay on camera feed
     game = BallCatchingGame(use_mock=False)
     game.run()
