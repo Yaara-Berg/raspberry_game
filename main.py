@@ -64,100 +64,41 @@ class HailoPoseEstimation:
             print("ERROR: Failed to initialize Hailo pipeline!")
             print("Error details:", str(e))
             raise
-        
+
     def get_keypoints(self):
+        """Get the current pose keypoints from the Hailo pipeline"""
         try:
-            # Check if process is still alive
-            if self.process.poll() is not None:
-                print("ERROR: Pipeline process has terminated!")
-                stdout, stderr = self.process.communicate()
-                print("Process stdout:", stdout)
-                print("Process stderr:", stderr)
+            # Read a line from stdout
+            line = self.process.stdout.readline().strip()
+            if not line:
                 return None
             
-            # Check for any stderr output without blocking
-            try:
-                rlist, _, _ = select.select([self.process.stderr], [], [], 0.1)  # 0.1 second timeout
-                if rlist:
-                    stderr_line = self.process.stderr.readline()
-                    if stderr_line and not "Viewfinder frame" in stderr_line:  # Filter out viewfinder messages
-                        print("Pipeline message:", stderr_line.strip())
-            except:
-                pass
-                
-            # Read one line of output from the pipeline with timeout
-            try:
-                rlist, _, _ = select.select([self.process.stdout], [], [], 0.1)  # 0.1 second timeout
-                if not rlist:
-                    return None  # No data available
-                    
-                line = self.process.stdout.readline()
-                if line:
-                    if "Viewfinder frame" not in line:  # Filter out viewfinder messages
-                        print("\nReceived data:", line.strip())
-                        try:
-                            # Parse the JSON output
-                            data = json.loads(line)
-                            if 'poses' in data and len(data['poses']) > 0:
-                                print(f"Found {len(data['poses'])} poses")
-                                # Return the keypoints of the first detected person
-                                keypoints = data['poses'][0]['keypoints']
-                                print("Original keypoints:", keypoints)
-                                # Scale keypoints to match game window size
-                                scaled_keypoints = []
-                                for kp in keypoints:
-                                    # Scale from 640x640 camera resolution to game window size (800x600)
-                                    scaled_keypoints.append([
-                                        int(kp[0] * 800/640),  # Scale X coordinate
-                                        int(kp[1] * 600/640)   # Scale Y coordinate - now using 640 as source height
-                                    ])
-                                print("Scaled keypoints:", scaled_keypoints)
-                                return scaled_keypoints
-                            else:
-                                print("No poses detected in frame")
-                        except json.JSONDecodeError as e:
-                            print("ERROR: Failed to parse JSON data!")
-                            print("Raw data:", line)
-                            print("Error details:", str(e))
-                else:
-                    print("No data received from pipeline")
-            except Exception as e:
-                print(f"ERROR reading pipeline output: {e}")
-            return None
+            # Parse the JSON output
+            data = json.loads(line)
+            if not data or 'keypoints' not in data:
+                return None
+            
+            # Extract keypoints
+            keypoints = data['keypoints']
+            if not keypoints:
+                return None
+            
+            # Return the keypoints
+            return keypoints
+            
         except Exception as e:
-            print(f"ERROR: Error reading pose data: {e}")
-            print("Error type:", type(e).__name__)
-            print("Error details:", str(e))
+            print("Error getting keypoints:", str(e))
             return None
-            
+
     def cleanup(self):
-        """Cleanup resources and close windows"""
-        print("\nStarting cleanup...")
+        """Clean up resources"""
         if self.process:
-            print("Terminating Hailo pipeline process...")
+            self.process.terminate()
             try:
-                self.process.terminate()
-                print("Waiting for process to end...")
-                self.process.wait(timeout=5)  # Wait up to 5 seconds
-                print("Process terminated successfully")
+                self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                print("WARNING: Process did not terminate, forcing kill...")
                 self.process.kill()
-                self.process.wait()
-                print("Process killed")
-            except Exception as e:
-                print("ERROR during process cleanup:", str(e))
-            
-            # Add a small delay to ensure windows close
-            print("Cleaning up windows...")
-            time.sleep(0.5)
-            # Try to close any remaining windows
-            try:
-                cv2.destroyAllWindows()
-                print("Windows cleaned up successfully")
-            except Exception as e:
-                print("ERROR cleaning up windows:", str(e))
-        print("Cleanup complete!")
+            self.process = None
 
 class MockPoseEstimation:
     """Mock pose estimation for testing"""
@@ -289,7 +230,19 @@ class BallCatchingGame:
         image_array = np.frombuffer(image_string, dtype=np.uint8)
         # Reshape to 2D array with RGBA channels
         image_array = image_array.reshape((surface.get_height(), surface.get_width(), 4))
-        return image_array
+        
+        # Convert RGBA to BGR (what OpenCV uses) but keep alpha
+        bgr = cv2.cvtColor(image_array, cv2.COLOR_RGBA2BGR)
+        alpha = image_array[:, :, 3]
+        
+        # Create a mask from the alpha channel
+        alpha_normalized = alpha / 255.0
+        alpha_bgr = cv2.merge([alpha_normalized, alpha_normalized, alpha_normalized])
+        
+        # Create the final overlay
+        overlay = (bgr * alpha_bgr).astype(np.uint8)
+        
+        return overlay
 
     def run(self):
         """Main game loop"""
@@ -365,7 +318,8 @@ class BallCatchingGame:
             if not self.use_mock:
                 # Convert Pygame surface to CV2 overlay
                 overlay = self.pygame_surface_to_cv2_overlay(self.screen)
-                # Show the overlay in the existing "Pose" window
+                # Add the overlay to the existing "Pose" window
+                cv2.setWindowProperty("Pose", cv2.WND_PROP_TOPMOST, 1)
                 cv2.imshow("Pose", overlay)
                 cv2.waitKey(1)
             else:
