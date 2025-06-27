@@ -32,9 +32,13 @@ class HailoPoseEstimation:
         print("Starting HailoPoseEstimation initialization...")
         try:
             print("Attempting to start rpicam-hello process...")
-            print("Command: rpicam-hello -t 0 --post-process-file /usr/share/rpi-camera-assets/hailo_yolov8_pose.json")
+            # Use the actual camera resolution we see in the logs
+            cmd = ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json',
+                  '--width', '640', '--height', '640']  # Match the lores size from logs
+            print("Command:", ' '.join(cmd))
+            
             self.process = subprocess.Popen(
-                ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json'],
+                cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 universal_newlines=True,
@@ -42,7 +46,7 @@ class HailoPoseEstimation:
             )
             print("Process started successfully")
             print("Waiting for pipeline initialization...")
-            time.sleep(2)  # Give time for pipeline to initialize
+            time.sleep(3)  # Give more time for pipeline to initialize
             
             # Check if process is still running
             if self.process.poll() is not None:
@@ -55,6 +59,15 @@ class HailoPoseEstimation:
                 raise Exception("Pipeline process terminated unexpectedly")
                 
             print("Pipeline initialization complete!")
+            
+            # Try to read initial data
+            print("Attempting to read initial pose data...")
+            initial_data = self.process.stdout.readline()
+            if initial_data:
+                print("Initial data received:", initial_data.strip())
+            else:
+                print("No initial data received")
+                
         except FileNotFoundError as e:
             print("ERROR: Could not find rpicam-hello command!")
             print("Make sure Hailo software is installed and in system PATH")
@@ -74,38 +87,46 @@ class HailoPoseEstimation:
                 print("Process stdout:", stdout)
                 print("Process stderr:", stderr)
                 return None
+            
+            # Check for any stderr output without blocking
+            try:
+                stderr_line = self.process.stderr.readline()
+                if stderr_line:
+                    print("Pipeline stderr:", stderr_line.strip())
+            except:
+                pass
                 
             # Read one line of output from the pipeline
             print("Reading pose data from pipeline...")
             line = self.process.stdout.readline()
             if line:
                 print("Received data:", line.strip())
-                # Parse the JSON output
-                data = json.loads(line)
-                if 'poses' in data and len(data['poses']) > 0:
-                    print(f"Found {len(data['poses'])} poses")
-                    # Return the keypoints of the first detected person
-                    keypoints = data['poses'][0]['keypoints']
-                    print("Original keypoints:", keypoints)
-                    # Scale keypoints to match game window size
-                    scaled_keypoints = []
-                    for kp in keypoints:
-                        # Scale from 640x480 camera resolution to game window size (800x600)
-                        scaled_keypoints.append([
-                            int(kp[0] * 800/640),  # Scale X coordinate
-                            int(kp[1] * 600/480)   # Scale Y coordinate
-                        ])
-                    print("Scaled keypoints:", scaled_keypoints)
-                    return scaled_keypoints
-                else:
-                    print("No poses detected in frame")
+                try:
+                    # Parse the JSON output
+                    data = json.loads(line)
+                    if 'poses' in data and len(data['poses']) > 0:
+                        print(f"Found {len(data['poses'])} poses")
+                        # Return the keypoints of the first detected person
+                        keypoints = data['poses'][0]['keypoints']
+                        print("Original keypoints:", keypoints)
+                        # Scale keypoints to match game window size
+                        scaled_keypoints = []
+                        for kp in keypoints:
+                            # Scale from 640x640 camera resolution to game window size (800x600)
+                            scaled_keypoints.append([
+                                int(kp[0] * 800/640),  # Scale X coordinate
+                                int(kp[1] * 600/640)   # Scale Y coordinate - now using 640 as source height
+                            ])
+                        print("Scaled keypoints:", scaled_keypoints)
+                        return scaled_keypoints
+                    else:
+                        print("No poses detected in frame")
+                except json.JSONDecodeError as e:
+                    print("ERROR: Failed to parse JSON data!")
+                    print("Raw data:", line)
+                    print("Error details:", str(e))
             else:
                 print("No data received from pipeline")
-            return None
-        except json.JSONDecodeError as e:
-            print("ERROR: Failed to parse JSON data from pipeline!")
-            print("Raw data:", line)
-            print("Error details:", str(e))
             return None
         except Exception as e:
             print(f"ERROR: Error reading pose data: {e}")
@@ -337,6 +358,6 @@ class BallCatchingGame:
         pygame.quit()
 
 if __name__ == "__main__":
-    # Use mock pipeline for testing
+    # Use real Hailo pose estimation with improved pipeline handling
     game = BallCatchingGame(use_mock=False)
     game.run()
