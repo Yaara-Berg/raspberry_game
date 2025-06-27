@@ -6,6 +6,7 @@ import subprocess
 import json
 from collections import deque
 import cv2
+import select
 
 class Ball:
     def __init__(self, x, screen_width):
@@ -34,7 +35,7 @@ class HailoPoseEstimation:
             print("Attempting to start rpicam-hello process...")
             # Use the actual camera resolution we see in the logs
             cmd = ['rpicam-hello', '-t', '0', '--post-process-file', '/usr/share/rpi-camera-assets/hailo_yolov8_pose.json',
-                  '--width', '640', '--height', '640']  # Match the lores size from logs
+                  '--width', '640', '--height', '640', '--verbose']  # Added verbose flag for more info
             print("Command:", ' '.join(cmd))
             
             self.process = subprocess.Popen(
@@ -60,14 +61,20 @@ class HailoPoseEstimation:
                 
             print("Pipeline initialization complete!")
             
-            # Try to read initial data
-            print("Attempting to read initial pose data...")
-            initial_data = self.process.stdout.readline()
-            if initial_data:
-                print("Initial data received:", initial_data.strip())
-            else:
-                print("No initial data received")
-                
+            # Read any initial stderr output
+            print("Checking for pipeline messages...")
+            while True:
+                try:
+                    # Use select to check if there's data to read without blocking
+                    rlist, _, _ = select.select([self.process.stderr], [], [], 0.1)  # 0.1 second timeout
+                    if not rlist:
+                        break
+                    stderr_line = self.process.stderr.readline()
+                    if stderr_line:
+                        print("Pipeline message:", stderr_line.strip())
+                except:
+                    break
+                    
         except FileNotFoundError as e:
             print("ERROR: Could not find rpicam-hello command!")
             print("Make sure Hailo software is installed and in system PATH")
@@ -90,43 +97,51 @@ class HailoPoseEstimation:
             
             # Check for any stderr output without blocking
             try:
-                stderr_line = self.process.stderr.readline()
-                if stderr_line:
-                    print("Pipeline stderr:", stderr_line.strip())
+                rlist, _, _ = select.select([self.process.stderr], [], [], 0.1)  # 0.1 second timeout
+                if rlist:
+                    stderr_line = self.process.stderr.readline()
+                    if stderr_line:
+                        print("Pipeline message:", stderr_line.strip())
             except:
                 pass
                 
-            # Read one line of output from the pipeline
-            print("Reading pose data from pipeline...")
-            line = self.process.stdout.readline()
-            if line:
-                print("Received data:", line.strip())
-                try:
-                    # Parse the JSON output
-                    data = json.loads(line)
-                    if 'poses' in data and len(data['poses']) > 0:
-                        print(f"Found {len(data['poses'])} poses")
-                        # Return the keypoints of the first detected person
-                        keypoints = data['poses'][0]['keypoints']
-                        print("Original keypoints:", keypoints)
-                        # Scale keypoints to match game window size
-                        scaled_keypoints = []
-                        for kp in keypoints:
-                            # Scale from 640x640 camera resolution to game window size (800x600)
-                            scaled_keypoints.append([
-                                int(kp[0] * 800/640),  # Scale X coordinate
-                                int(kp[1] * 600/640)   # Scale Y coordinate - now using 640 as source height
-                            ])
-                        print("Scaled keypoints:", scaled_keypoints)
-                        return scaled_keypoints
-                    else:
-                        print("No poses detected in frame")
-                except json.JSONDecodeError as e:
-                    print("ERROR: Failed to parse JSON data!")
-                    print("Raw data:", line)
-                    print("Error details:", str(e))
-            else:
-                print("No data received from pipeline")
+            # Read one line of output from the pipeline with timeout
+            try:
+                rlist, _, _ = select.select([self.process.stdout], [], [], 0.1)  # 0.1 second timeout
+                if not rlist:
+                    return None  # No data available
+                    
+                line = self.process.stdout.readline()
+                if line:
+                    print("Received data:", line.strip())
+                    try:
+                        # Parse the JSON output
+                        data = json.loads(line)
+                        if 'poses' in data and len(data['poses']) > 0:
+                            print(f"Found {len(data['poses'])} poses")
+                            # Return the keypoints of the first detected person
+                            keypoints = data['poses'][0]['keypoints']
+                            print("Original keypoints:", keypoints)
+                            # Scale keypoints to match game window size
+                            scaled_keypoints = []
+                            for kp in keypoints:
+                                # Scale from 640x640 camera resolution to game window size (800x600)
+                                scaled_keypoints.append([
+                                    int(kp[0] * 800/640),  # Scale X coordinate
+                                    int(kp[1] * 600/640)   # Scale Y coordinate - now using 640 as source height
+                                ])
+                            print("Scaled keypoints:", scaled_keypoints)
+                            return scaled_keypoints
+                        else:
+                            print("No poses detected in frame")
+                    except json.JSONDecodeError as e:
+                        print("ERROR: Failed to parse JSON data!")
+                        print("Raw data:", line)
+                        print("Error details:", str(e))
+                else:
+                    print("No data received from pipeline")
+            except Exception as e:
+                print(f"ERROR reading pipeline output: {e}")
             return None
         except Exception as e:
             print(f"ERROR: Error reading pose data: {e}")
@@ -207,9 +222,13 @@ class BallCatchingGame:
         self.use_mock = use_mock
         self.pose_estimator = MockPoseEstimation() if use_mock else HailoPoseEstimation()
         
-        # Hand hitboxes
+        # Hand positions and hitboxes
         self.hand_width = 40
         self.hand_height = 20
+        self.default_left_hand = [200, 500]  # Default position when no pose detected
+        self.default_right_hand = [600, 500]  # Default position when no pose detected
+        self.current_left_hand = self.default_left_hand.copy()
+        self.current_right_hand = self.default_right_hand.copy()
         
         # For real mode, we need to make sure pygame window stays on top
         if not use_mock:
@@ -277,17 +296,14 @@ class BallCatchingGame:
         # Draw time remaining
         time_text = self.font.render('Time: {}s'.format(int(time_remaining)), True, (255, 255, 255))
         self.screen.blit(time_text, (10, 50))
-        
-        # Draw instructions if using mock pipeline
-        if isinstance(self.pose_estimator, MockPoseEstimation):
-            instructions = self.font.render('Move mouse to control hands', True, (255, 255, 255))
-            self.screen.blit(instructions, (10, self.screen_height - 40))
     
     def run(self):
         """Main game loop"""
         self.start_time = time.time()
         running = True
-        clock = pygame.time.Clock()  # Add clock for consistent frame rate
+        clock = pygame.time.Clock()
+        last_pose_time = time.time()
+        show_help = True  # Flag to control help message visibility
         
         while running:
             current_time = time.time()
@@ -298,8 +314,11 @@ class BallCatchingGame:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
-                elif event.type == pygame.KEYDOWN and event.key == pygame.K_q:
-                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_q:
+                        running = False
+                    elif event.key == pygame.K_h:  # Toggle help with H key
+                        show_help = not show_help
             
             # Clear screen at start of frame
             self.screen.fill((0, 0, 0))
@@ -314,27 +333,37 @@ class BallCatchingGame:
             # Get hand positions from pose estimation
             keypoints = self.pose_estimator.get_keypoints()
             if keypoints and len(keypoints) >= 11:
-                left_hand_pos = keypoints[9]   # Left wrist
-                right_hand_pos = keypoints[10]  # Right wrist
+                last_pose_time = current_time
+                self.current_left_hand = keypoints[9]   # Left wrist
+                self.current_right_hand = keypoints[10]  # Right wrist
+            elif current_time - last_pose_time > 5 and show_help:  # Show help message after 5 seconds without poses
+                msg = self.font.render('Stand in front of camera to play!', True, (255, 255, 255))
+                msg_rect = msg.get_rect(center=(self.screen_width/2, 50))
+                self.screen.blit(msg, msg_rect)
                 
-                # Update game state
-                self.check_catches(left_hand_pos, right_hand_pos)
-                
-                # Draw hands
-                self.draw_hands(left_hand_pos, right_hand_pos)
-                
-                # Update and draw balls
-                for ball in self.balls[:]:
-                    if ball.update(self.screen_height):
-                        self.balls.remove(ball)
-                    else:
-                        ball.draw(self.screen)
-                
-                # Draw UI
-                self.draw_ui(time_remaining)
-                
-                # Update display
-                pygame.display.flip()
+                if not self.use_mock:
+                    help_msg = self.font.render('Press H to hide this message', True, (255, 255, 255))
+                    help_rect = help_msg.get_rect(center=(self.screen_width/2, 90))
+                    self.screen.blit(help_msg, help_rect)
+            
+            # Update game state with current hand positions
+            self.check_catches(self.current_left_hand, self.current_right_hand)
+            
+            # Draw hands at current positions
+            self.draw_hands(self.current_left_hand, self.current_right_hand)
+            
+            # Update and draw balls
+            for ball in self.balls[:]:
+                if ball.update(self.screen_height):
+                    self.balls.remove(ball)
+                else:
+                    ball.draw(self.screen)
+            
+            # Draw UI
+            self.draw_ui(time_remaining)
+            
+            # Update display
+            pygame.display.flip()
             
             # Maintain consistent frame rate
             clock.tick(60)
@@ -358,6 +387,6 @@ class BallCatchingGame:
         pygame.quit()
 
 if __name__ == "__main__":
-    # Use real Hailo pose estimation with improved pipeline handling
+    # Use real Hailo pose estimation with immediate gameplay
     game = BallCatchingGame(use_mock=False)
     game.run()
